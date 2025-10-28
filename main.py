@@ -49,13 +49,18 @@ class Exercise(BaseModel):
     distance_range: Optional[str] = None
     type: str = "strength"
 
+class Superset(BaseModel):
+    exercises: List[Exercise] = Field(default_factory=list)
+    rest_between_sec: Optional[int] = None       # rest between exercises in superset
+
 class Block(BaseModel):
     label: Optional[str] = None
     structure: Optional[str] = None              # "3 rounds", "4 sets"
     rest_between_sec: Optional[int] = None       # between sets/rounds
     time_work_sec: Optional[int] = None          # for time-based circuits (e.g., Tabata 20s)
     default_reps_range: Optional[str] = None     # "10-12"
-    exercises: List[Exercise] = Field(default_factory=list)
+    exercises: List[Exercise] = Field(default_factory=list)  # for backward compatibility
+    supersets: List[Superset] = Field(default_factory=list)  # new superset support
 
 class Workout(BaseModel):
     title: str = "Imported Workout"
@@ -64,9 +69,53 @@ class Workout(BaseModel):
 
 # ---------- OCR ----------
 def ocr_image_bytes(b: bytes) -> str:
+    import numpy as np
+    from PIL import ImageEnhance, ImageFilter
+    
     img = Image.open(io.BytesIO(b))
+    
+    # Convert to grayscale
     img = img.convert("L")
-    return pytesseract.image_to_string(img)
+    
+    # Upscale image for better OCR (especially for small text like "Ax", "Az")
+    # Scale to at least 300 DPI equivalent (2x-3x scaling helps with small text)
+    width, height = img.size
+    if width < 2000 or height < 2000:
+        # Upscale by factor to ensure minimum dimensions
+        scale_factor = max(2000 / width, 2000 / height, 2.0)
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+    
+    # Enhance contrast to improve binarization
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.0)  # Increase contrast by 2x
+    
+    # Apply slight sharpening to make edges clearer
+    img = img.filter(ImageFilter.SHARPEN)
+    
+    # Binarize (threshold) to black and white
+    # Convert to numpy array for thresholding
+    img_array = np.array(img)
+    
+    # Use Otsu's method for automatic thresholding or adaptive threshold
+    # For simplicity, use a fixed threshold - adjust based on typical image brightness
+    threshold = 128  # Middle gray
+    img_array = np.where(img_array > threshold, 255, 0).astype(np.uint8)
+    
+    # Convert back to PIL Image
+    img = Image.fromarray(img_array)
+    
+    # Use pytesseract with optimized config for better accuracy
+    # --psm 6: Assume a single uniform block of text
+    # -c tessedit_char_whitelist: Focus on common characters in workout plans
+    custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:/X-\\s\\.\''
+    
+    try:
+        return pytesseract.image_to_string(img, config=custom_config)
+    except Exception:
+        # Fallback to default config if custom config fails
+        return pytesseract.image_to_string(img)
 
 # ---------- Video helpers ----------
 def ytdlp_extract(url: str) -> Tuple[str, str, str]:
@@ -117,11 +166,12 @@ SKI_DEFAULT_WORK = 60
 SKI_DEFAULT_REST = 90
 
 # Re-used patterns
-RE_DISTANCE = re.compile(r"\b(?P<d1>\d+)(?:[\-–](?P<d2>\d+))?\s*(m|meter|meters|km|mi|mile|miles)\b", re.I)
+RE_DISTANCE = re.compile(r"(?P<d1>\d+)(?:[\-–](?P<d2>\d+))?\s*(m|meter|meters|km|mi|mile|miles)\b", re.I)
 RE_REPS_RANGE = re.compile(r"(?P<rmin>\d+)\s*[\-–]\s*(?P<rmax>\d+)\s*reps?", re.I)
 RE_REPS_AFTER_X = re.compile(r"[x×]\s*(?P<rmin>\d+)\s*[\-–]\s*(?P<rmax>\d+)\b", re.I)
 RE_REPS_PLAIN_X = re.compile(r"[x×]\s*(?P<reps>\d+)\b", re.I)
-RE_LABELED = re.compile(r"^[A-D]\d+[:\-]?\s*(.*)", re.I)
+RE_LABELED = re.compile(r"^[A-E](?:[0-9A-Za-z]+)?[:\-]?\s*(.*)", re.I)
+RE_LETTER_START = re.compile(r"^['\"]?[A-E]", re.I)  # Check if line starts with A-E (with optional quote)
 RE_HEADER = re.compile(r"(primer|strength|power|finisher|metabolic|conditioning|amrap|circuit|muscular\s+endurance|tabata|warm.?up)", re.I)
 RE_WEEK = re.compile(r"^(week\s*\d+\s*of\s*\d+)", re.I)
 RE_TITLE_HINT = re.compile(r"^(upper|lower|full)\s+body|workout|dumbbell", re.I)
@@ -144,6 +194,14 @@ def _to_int(s: Optional[str]) -> Optional[int]:
 
 def _looks_like_header(ln: str) -> bool:
     # Short, mostly letters, uppercase → treat as a section label
+    # But NOT if it starts with a labeled exercise pattern (A1:, B2:, etc.)
+    if re.match(r"^[A-E](?:[0-9A-Za-z]+)?[:\-]?\s*", ln):
+        return False  # This is a labeled exercise, not a header
+    
+    # Don't treat instruction lines as headers (they contain numbers and specific words)
+    if re.search(r"\d+\s*(rounds?|sets?|mins?|secs?|rest)", ln.lower()):
+        return False
+    
     if len(ln) <= 28 and ln.replace("/", " ").isupper() and re.search(r"[A-Z]{3}", ln):
         return True
     return False
@@ -152,16 +210,75 @@ def _is_junk(ln: str) -> bool:
     # Skip very short or mostly punctuation / OCR gunk
     if len(ln) < 4:
         return True
+    
+    # Skip lines that look like "block 1", "block 2", etc. (OCR artifacts)
+    if re.match(r'^block\s+\d+$', ln.lower()):
+        return True
+    
+    # Skip lines that are just single letters or weird patterns like "q:Ry"
+    if re.match(r'^[a-z]:[A-Z][a-z]+$', ln):
+        return True
+    
+    # Count letters and common punctuation
     letters = re.sub(r"[^A-Za-z]", "", ln)
-    return len(letters) <= 2
+    if len(letters) <= 2:
+        return True
+    
+    # Skip lines with excessive backslashes or weird characters (OCR artifacts)
+    if ln.count('\\') > 2 or ln.count('|') > 2:
+        return True
+    
+    # Skip lines that look like corrupted text (mix of letters, numbers, symbols in weird patterns)
+    # Pattern: starts with backslash, has weird spacing, or looks like OCR gibberish
+    if re.match(r'^\\\s*[a-z]\.\s*[a-z]', ln.lower()):
+        return True
+    
+    # Skip lines with too many single characters separated by spaces/punctuation
+    single_chars = re.findall(r'\b[a-z]\b', ln.lower())
+    if len(single_chars) > len(ln.split()) * 0.5:  # More than 50% single characters
+        return True
+    
+    # Skip lines that don't contain any recognizable exercise-related words
+    exercise_words = ['press', 'squat', 'deadlift', 'row', 'pull', 'push', 'curl', 'extension', 
+                     'flexion', 'raise', 'lift', 'hold', 'plank', 'burpee', 'jump', 'run', 
+                     'walk', 'bike', 'swim', 'ski', 'erg', 'meter', 'rep', 'set', 'round',
+                     'goodmorning', 'sled', 'drag', 'carry', 'farmer', 'hand', 'release',
+                     'kb', 'db', 'dual', 'alternating', 'broad', 'swing', 'skier']
+    ln_lower = ln.lower()
+    has_exercise_word = any(word in ln_lower for word in exercise_words)
+    
+    # If it's a short line without exercise words and has weird characters, skip it
+    if len(ln) < 20 and not has_exercise_word and re.search(r'[\\|\.]{2,}', ln):
+        return True
+    
+    return False
 
 def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Workout:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    
+    # Clean up OCR artifacts before processing
+    cleaned_lines = []
+    for ln in lines:
+        # Clean up common OCR artifacts - be very aggressive
+        ln = ln.replace("'", "").replace("'", "").replace("'", "")  # Remove all types of quotes
+        # Fix specific OCR issues FIRST, before general patterns
+        ln = re.sub(r"^Ax:", "A1:", ln)  # Fix "Ax:" -> "A1:"
+        ln = re.sub(r"^Az:", "A2:", ln)  # Fix "Az:" -> "A2:"
+        ln = re.sub(r"^A3:", "A3:", ln)  # Ensure A3 is properly formatted
+        # Then apply general patterns
+        ln = re.sub(r"^([A-E])[a-z]+:", r"\1:", ln)  # Fix other "Ax:" -> "A:", "Az:" -> "A:"
+        ln = re.sub(r"oS OFF", "90S OFF", ln)  # Fix "oS OFF" -> "90S OFF"
+        # Handle any remaining quote issues
+        ln = re.sub(r"^'([A-E])", r"\1", ln)  # Remove leading quotes from letters
+        cleaned_lines.append(ln)
+    
     blocks: List[Block] = []
     current = Block(label="Block 1")
     wk_title = None
+    current_superset: List[Exercise] = []  # Track exercises for current superset
+    superset_letter = None  # Track current superset letter (A, B, C, D, etc.)
 
-    for ln in lines:
+    for ln in cleaned_lines:
         if _is_junk(ln):
             continue
 
@@ -190,7 +307,12 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
 
         # Section headers
         if RE_HEADER.search(ln) or _looks_like_header(ln):
-            if current.exercises:
+            # Finish current superset if any
+            if current_superset:
+                current.supersets.append(Superset(exercises=current_superset.copy()))
+                current_superset.clear()
+            
+            if current.exercises or current.supersets:
                 blocks.append(current)
             # Normalize a few known variants to nicer labels
             lbl = ln.title()
@@ -199,6 +321,7 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
             if re.search(r"metabolic|conditioning", ln, re.I):
                 lbl = "Metabolic Conditioning"
             current = Block(label=lbl)
+            superset_letter = None  # Reset superset tracking
             # Inline structure / default reps in header
             m_struct = RE_ROUNDS_SETS.search(ln)
             if m_struct:
@@ -222,7 +345,8 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
             continue
 
         # Ski Erg special: set timed block config but don't misread distance lines like "200m ski"
-        if RE_SKI.search(ln):
+        # Only trigger if it's NOT a labeled exercise (labeled exercises are handled later)
+        if RE_SKI.search(ln) and not RE_LETTER_START.match(ln):
             current.label = "Ski Erg"
             # Set default timing if not already set
             current.time_work_sec = current.time_work_sec or SKI_DEFAULT_WORK
@@ -243,9 +367,23 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
             continue
 
         # ----- Exercises -----
-        m_lab = RE_LABELED.match(ln)
-        if m_lab:
-            ln = m_lab.group(1)
+        # Store the full line for the exercise name, before stripping the label
+        full_line_for_name = ln
+        
+        # Check if line starts with A-E (more flexible for OCR artifacts)
+        letter_match = RE_LETTER_START.match(ln)
+        exercise_letter = None
+        if letter_match:
+            # Extract the actual letter, skipping any leading quotes
+            letter_part = letter_match.group(0)
+            exercise_letter = letter_part[-1].upper()  # Get the last character (the actual letter)
+            # Try to extract exercise name after the letter
+            m_lab = RE_LABELED.match(ln)
+            if m_lab:
+                ln = m_lab.group(1)
+            else:
+                # If labeled regex doesn't match, just remove the first character and colon
+                ln = re.sub(r"^[A-E][:\-]?\s*", "", ln)
 
         # reps-range (x6-10 or 6-10 reps), single reps (x10)
         reps_range = None
@@ -276,16 +414,74 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
         # classify: strength if it has reps/reps_range or distance; else interval
         ex_type = "strength" if (reps or reps_range or distance_m or distance_range) else "interval"
 
-        current.exercises.append(Exercise(
-            name=ln.strip(" ."),
+        # Clean and validate exercise name
+        exercise_name = full_line_for_name.strip(" .")
+        
+        # Additional validation for exercise names
+        if _is_junk(exercise_name):
+            continue  # Skip this line entirely
+        
+        # Skip names that are clearly OCR artifacts
+        if re.search(r'^\\\s*[a-z]\.\s*[a-z]', exercise_name.lower()):
+            continue
+        
+        exercise = Exercise(
+            name=exercise_name,
             reps=reps,
             reps_range=reps_range,
             distance_m=distance_m,
             distance_range=distance_range,
             type=ex_type
-        ))
+        )
+        
+        # Handle supersets vs individual exercises
+        if exercise_letter:
+            # Special case: METABOLIC CONDITIONING E exercises should be individual, not supersets
+            if current.label and "Metabolic Conditioning" in current.label and exercise_letter == "E":
+                # Finish current superset if any
+                if current_superset:
+                    current.supersets.append(Superset(exercises=current_superset.copy()))
+                    current_superset.clear()
+                    superset_letter = None
+                # Add as individual exercise
+                current.exercises.append(exercise)
+            # For most blocks, group all exercises into one superset
+            # Exception: MUSCULAR ENDURANCE has multiple supersets (C1,C2 and D1,D2)
+            elif current.label and "Muscular Endurance" in current.label:
+                # Special case: MUSCULAR ENDURANCE has multiple supersets
+                if superset_letter != exercise_letter:
+                    # Finish previous superset if any
+                    if current_superset:
+                        current.supersets.append(Superset(exercises=current_superset.copy()))
+                    # Start new superset
+                    current_superset = [exercise]
+                    superset_letter = exercise_letter
+                else:
+                    # Add to current superset
+                    current_superset.append(exercise)
+            else:
+                # For all other blocks, group all exercises into one superset
+                if not current_superset:
+                    # Start the superset for this block
+                    current_superset = [exercise]
+                    superset_letter = exercise_letter
+                else:
+                    # Add to the existing superset for this block
+                    current_superset.append(exercise)
+        else:
+            # Finish current superset if any (unlabeled exercise starts)
+            if current_superset:
+                current.supersets.append(Superset(exercises=current_superset.copy()))
+                current_superset.clear()
+                superset_letter = None
+            # Add as individual exercise
+            current.exercises.append(exercise)
 
-    if current.exercises:
+    # Finish any remaining superset
+    if current_superset:
+        current.supersets.append(Superset(exercises=current_superset.copy()))
+    
+    if current.exercises or current.supersets:
         blocks.append(current)
 
     return Workout(title=(wk_title or "Imported Workout"), source=source, blocks=blocks)
@@ -304,6 +500,25 @@ def render_text_for_tp(workout: Workout) -> str:
         if b.rest_between_sec: meta.append(f"{b.rest_between_sec}s rest")
         if meta: hdr += f" ({', '.join(meta)})"
         lines.append(f"## {hdr}")
+        
+        # Render supersets
+        for si, superset in enumerate(b.supersets):
+            if len(b.supersets) > 1:
+                lines.append(f"### Superset {si + 1}")
+            for e in superset.exercises:
+                parts = [e.name]
+                if e.sets: parts.append(f"{e.sets} sets")
+                if e.reps_range: parts.append(f"{e.reps_range} reps")
+                elif e.reps: parts.append(f"{e.reps} reps")
+                if e.distance_range: parts.append(e.distance_range)
+                elif e.distance_m: parts.append(f"{e.distance_m}m")
+                if b.time_work_sec and not e.reps and not e.reps_range and not e.distance_m and not e.distance_range:
+                    parts.append(f"{b.time_work_sec}s")
+                lines.append("• " + " — ".join(parts))
+            if superset.rest_between_sec:
+                lines.append(f"Rest: {superset.rest_between_sec}s between exercises")
+        
+        # Render individual exercises
         for e in b.exercises:
             parts = [e.name]
             if e.sets: parts.append(f"{e.sets} sets")

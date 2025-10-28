@@ -59,6 +59,7 @@ class Block(BaseModel):
     rest_between_sec: Optional[int] = None       # between sets/rounds
     time_work_sec: Optional[int] = None          # for time-based circuits (e.g., Tabata 20s)
     default_reps_range: Optional[str] = None     # "10-12"
+    default_sets: Optional[int] = None           # number of sets/rounds (from structure)
     exercises: List[Exercise] = Field(default_factory=list)  # for backward compatibility
     supersets: List[Superset] = Field(default_factory=list)  # new superset support
 
@@ -348,6 +349,8 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
             m_struct = RE_ROUNDS_SETS.search(ln)
             if m_struct:
                 current.structure = f"{m_struct.group('n')} {m_struct.group('kind').lower()}"
+                # Store the number of rounds/sets as default sets for exercises in this block
+                current.default_sets = _to_int(m_struct.group("n"))
             m_range = RE_REPS_RANGE.search(ln)
             if m_range:
                 current.default_reps_range = f"{m_range.group('rmin')}-{m_range.group('rmax')}"
@@ -360,6 +363,8 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
         if m_s or m_r or m_range_only:
             if m_s:
                 current.structure = f"{m_s.group('n')} {m_s.group('kind').lower()}"
+                # Store the number of rounds/sets as default sets for exercises in this block
+                current.default_sets = _to_int(m_s.group("n"))
             if m_r:
                 current.rest_between_sec = _to_int(m_r.group("rest"))
             if m_range_only:
@@ -407,18 +412,26 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
                 # If labeled regex doesn't match, just remove the first character and colon
                 ln = re.sub(r"^[A-E][:\-]?\s*", "", ln)
 
-        # reps-range (x6-10 or 6-10 reps), single reps (x10)
-        reps_range = None
-        reps = None
-        m_rr = RE_REPS_RANGE.search(ln) or RE_REPS_AFTER_X.search(ln)
-        if m_rr:
-            reps_range = f"{m_rr.group('rmin')}-{m_rr.group('rmax')}"
-        else:
-            m_rx = RE_REPS_PLAIN_X.search(ln)
-            if m_rx:
-                reps = _to_int(m_rx.group("reps"))
-
-        # distance
+        # Check for interval/timed exercise pattern: "60S ON 90S OFF X3"
+        # This should extract: work time, rest time, and sets
+        interval_pattern = re.compile(r'(?P<work>\d+)S?\s+ON\s+(?P<rest>\d+)S?\s+OFF(?:\s+X(?P<sets>\d+))?', re.I)
+        m_interval = interval_pattern.search(ln)
+        
+        time_work_sec = None
+        rest_sec = None
+        sets = None
+        
+        if m_interval:
+            # This is a timed/interval exercise (like Ski Erg)
+            time_work_sec = _to_int(m_interval.group("work"))
+            rest_sec = _to_int(m_interval.group("rest"))
+            sets = _to_int(m_interval.group("sets"))
+            # Set block-level timing if not already set
+            if current.label and "Metabolic Conditioning" in current.label:
+                current.time_work_sec = current.time_work_sec or time_work_sec
+                current.rest_between_sec = current.rest_between_sec or rest_sec
+        
+        # distance (check before reps, as distance-based exercises don't have reps)
         distance_m = None
         distance_range = None
         m_dist = RE_DISTANCE.search(ln)
@@ -428,13 +441,31 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
                 distance_range = f"{d1}-{d2}m"
             else:
                 distance_m = _to_int(d1)
+        
+        # reps-range (x6-10 or 6-10 reps), single reps (x10)
+        # Don't parse reps if it's an interval exercise OR if distance is found (distance-based exercises)
+        reps_range = None
+        reps = None
+        
+        # Only parse reps if it's not an interval exercise and no distance is found
+        if not m_interval and not m_dist:
+            m_rr = RE_REPS_RANGE.search(ln) or RE_REPS_AFTER_X.search(ln)
+            if m_rr:
+                reps_range = f"{m_rr.group('rmin')}-{m_rr.group('rmax')}"
+            else:
+                m_rx = RE_REPS_PLAIN_X.search(ln)
+                if m_rx:
+                    reps = _to_int(m_rx.group("reps"))
 
-        # inherit reps_range from header if none on line
-        if not reps and not reps_range and current.default_reps_range:
+        # inherit reps_range from header if none on line (but not for distance-based exercises)
+        if not reps and not reps_range and not distance_m and not distance_range and current.default_reps_range:
             reps_range = current.default_reps_range
 
-        # classify: strength if it has reps/reps_range or distance; else interval
-        ex_type = "strength" if (reps or reps_range or distance_m or distance_range) else "interval"
+        # classify: interval if it has time_work_sec/rest_sec, strength if it has reps/reps_range or distance
+        if time_work_sec or rest_sec:
+            ex_type = "interval"
+        else:
+            ex_type = "strength" if (reps or reps_range or distance_m or distance_range) else "interval"
 
         # Clean and validate exercise name
         exercise_name = full_line_for_name.strip(" .")
@@ -455,10 +486,16 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
         if re.search(r'^\\\s*[a-z]\.\s*[a-z]', exercise_name.lower()):
             continue
         
+        # Use default_sets from block if sets not already set
+        exercise_sets = sets if sets is not None else current.default_sets
+        
         exercise = Exercise(
             name=exercise_name,
-            reps=reps,
+            sets=exercise_sets,  # Use parsed sets or default from block structure
+            reps=reps if not m_interval else None,  # Don't use reps for interval exercises
             reps_range=reps_range,
+            duration_sec=time_work_sec,
+            rest_sec=rest_sec,
             distance_m=distance_m,
             distance_range=distance_range,
             type=ex_type

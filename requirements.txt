@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn>=0.30
+pillow>=10
+pytesseract>=0.3.10
+yt-dlp>=2024.10.7
+fit-tool==0.9.13
+python-multipart>=0.0.9

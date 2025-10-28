@@ -107,12 +107,19 @@ def ocr_image_bytes(b: bytes) -> str:
     img = Image.fromarray(img_array)
     
     # Use pytesseract with optimized config for better accuracy
-    # --psm 6: Assume a single uniform block of text
-    # -c tessedit_char_whitelist: Focus on common characters in workout plans
-    custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:/X-\\s\\.\''
+    # --psm 6: Assume a single uniform block of text  
+    # Don't use whitelist - it can cause spacing issues
+    # Instead use PSM 6 which preserves spacing better
+    custom_config = r'--oem 3 --psm 6'
     
     try:
-        return pytesseract.image_to_string(img, config=custom_config)
+        text = pytesseract.image_to_string(img, config=custom_config)
+        # Post-process: ensure spaces are preserved around colons and X multipliers
+        # Add space after colon if missing: "A1:GOOD" -> "A1: GOOD"
+        text = re.sub(r'([A-E]\d*):([A-Z])', r'\1: \2', text)
+        # Add space before X when followed by number: "GOODX10" -> "GOOD X10"
+        text = re.sub(r'([A-Za-z])X(\d)', r'\1 X\2', text)
+        return text
     except Exception:
         # Fallback to default config if custom config fails
         return pytesseract.image_to_string(img)
@@ -209,6 +216,21 @@ def _looks_like_header(ln: str) -> bool:
 def _is_junk(ln: str) -> bool:
     # Skip very short or mostly punctuation / OCR gunk
     if len(ln) < 4:
+        return True
+    
+    # Skip Instagram UI elements - but only if the line doesn't contain exercise content
+    instagram_words = ['like', 'dislike', 'share', 'comment', 'follow', 'followers', 'following']
+    ln_lower = ln.lower()
+    # Check if line contains Instagram words AND no exercise indicators
+    exercise_indicators = ['x', ':', 'kg', 'kb', 'db', 'rep', 'set', 'round', 'meter', 'm', 'squat', 'press', 'push', 'pull', 'carry', 'sled', 'swing', 'burpee', 'jump']
+    has_exercise_content = any(indicator in ln_lower for indicator in exercise_indicators) or re.search(r'[A-E]\d*:', ln)
+    
+    if any(instagram_word in ln_lower for instagram_word in instagram_words) and not has_exercise_content:
+        return True
+    
+    # Skip lines that are just numbers (like Instagram like counts: "4", "0")
+    # But not if they're part of an exercise line or rep count
+    if re.match(r'^\d+$', ln.strip()) and len(ln.strip()) <= 3:
         return True
     
     # Skip lines that look like "block 1", "block 2", etc. (OCR artifacts)
@@ -416,6 +438,14 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
 
         # Clean and validate exercise name
         exercise_name = full_line_for_name.strip(" .")
+        
+        # Remove Instagram UI text that may appear at the end of exercise names
+        # Be careful not to remove valid exercise content - only remove if it's clearly Instagram UI
+        # Remove standalone Instagram words at the end
+        exercise_name = re.sub(r'\s+(Dislike|Share|Like|Comment|Follow|Followers|Following)$', '', exercise_name, flags=re.I)
+        # Remove single lowercase letters at the end (like "a", "s") that are likely OCR artifacts
+        exercise_name = re.sub(r'\s+([a-z])$', '', exercise_name)
+        exercise_name = exercise_name.strip()
         
         # Additional validation for exercise names
         if _is_junk(exercise_name):

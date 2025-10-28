@@ -115,7 +115,22 @@ def ocr_image_bytes(b: bytes) -> str:
     
     try:
         text = pytesseract.image_to_string(img, config=custom_config)
-        # Post-process: ensure spaces are preserved around colons and X multipliers
+        # Post-process: fix common OCR misreadings for exercise labels
+        # Fix "82:" -> "B2:" (B is often misread as 8)
+        text = re.sub(r'\b82([:\-])', r'B2\1', text)
+        # Fix similar misreadings for other exercise numbers
+        text = re.sub(r'\b81([:\-])', r'B1\1', text)
+        text = re.sub(r'\b83([:\-])', r'B3\1', text)
+        text = re.sub(r'\b72([:\-])', r'A2\1', text)
+        text = re.sub(r'\b71([:\-])', r'A1\1', text)
+        text = re.sub(r'\b73([:\-])', r'A3\1', text)
+        # Context-aware correction: if we see B1 followed by 82, correct to B2
+        text = re.sub(r'(\bB1[:\-].*?\n.*?)82([:\-])', r'\1B2\2', text, flags=re.MULTILINE | re.IGNORECASE)
+        # Same for other letter patterns (A1->82=A2, C1->82=C2, etc.)
+        text = re.sub(r'(\bA1[:\-].*?\n.*?)72([:\-])', r'\1A2\2', text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r'(\bC1[:\-].*?\n.*?)82([:\-])', r'\1C2\2', text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r'(\bD1[:\-].*?\n.*?)82([:\-])', r'\1D2\2', text, flags=re.MULTILINE | re.IGNORECASE)
+        # Ensure spaces are preserved around colons and X multipliers
         # Add space after colon if missing: "A1:GOOD" -> "A1: GOOD"
         text = re.sub(r'([A-E]\d*):([A-Z])', r'\1: \2', text)
         # Add space before X when followed by number: "GOODX10" -> "GOOD X10"
@@ -281,19 +296,43 @@ def parse_free_text_to_workout(text: str, source: Optional[str] = None) -> Worko
     
     # Clean up OCR artifacts before processing
     cleaned_lines = []
+    prev_line = ""  # Track previous line for context-aware corrections
     for ln in lines:
         # Clean up common OCR artifacts - be very aggressive
         ln = ln.replace("'", "").replace("'", "").replace("'", "")  # Remove all types of quotes
-        # Fix specific OCR issues FIRST, before general patterns
+        # Fix specific OCR misreadings for exercise labels
+        # Fix "82:" -> "B2:" (B is often misread as 8)
+        if re.match(r'^82[:\-]', ln):
+            # Context-aware: if previous line was B1, this is likely B2
+            if re.match(r'^B1[:\-]', prev_line):
+                ln = re.sub(r'^82([:\-])', r'B2\1', ln)
+            else:
+                # Could be B2, C2, D2 - check if previous line gives context
+                if re.match(r'^B\d+[:\-]', prev_line):
+                    ln = re.sub(r'^82([:\-])', r'B2\1', ln)
+                elif re.match(r'^C\d+[:\-]', prev_line):
+                    ln = re.sub(r'^82([:\-])', r'C2\1', ln)
+                elif re.match(r'^D\d+[:\-]', prev_line):
+                    ln = re.sub(r'^82([:\-])', r'D2\1', ln)
+                else:
+                    # Default to B2 as it's most common
+                    ln = re.sub(r'^82([:\-])', r'B2\1', ln)
+        # Fix other similar misreadings
+        ln = re.sub(r"^81([:\-])", "B1\1", ln)  # 81 -> B1
+        ln = re.sub(r"^83([:\-])", "B3\1", ln)  # 83 -> B3
+        ln = re.sub(r"^72([:\-])", "A2\1", ln)  # 72 -> A2
+        ln = re.sub(r"^71([:\-])", "A1\1", ln)  # 71 -> A1
+        ln = re.sub(r"^73([:\-])", "A3\1", ln)  # 73 -> A3
+        # Fix specific OCR issues
         ln = re.sub(r"^Ax:", "A1:", ln)  # Fix "Ax:" -> "A1:"
         ln = re.sub(r"^Az:", "A2:", ln)  # Fix "Az:" -> "A2:"
-        ln = re.sub(r"^A3:", "A3:", ln)  # Ensure A3 is properly formatted
         # Then apply general patterns
         ln = re.sub(r"^([A-E])[a-z]+:", r"\1:", ln)  # Fix other "Ax:" -> "A:", "Az:" -> "A:"
         ln = re.sub(r"oS OFF", "90S OFF", ln)  # Fix "oS OFF" -> "90S OFF"
         # Handle any remaining quote issues
         ln = re.sub(r"^'([A-E])", r"\1", ln)  # Remove leading quotes from letters
         cleaned_lines.append(ln)
+        prev_line = ln  # Update previous line for next iteration
     
     blocks: List[Block] = []
     current = Block(label="Block 1")
